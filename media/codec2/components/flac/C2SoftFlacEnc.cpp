@@ -188,11 +188,12 @@ c2_status_t C2SoftFlacEnc::onFlush_sm() {
     return onStop();
 }
 
-static void fillEmptyWork(const std::unique_ptr<C2Work> &work) {
-    work->worklets.front()->output.flags = work->input.flags;
-    work->worklets.front()->output.buffers.clear();
-    work->worklets.front()->output.ordinal = work->input.ordinal;
-}
+struct OutputBuffer {
+    std::shared_ptr<C2Buffer> buffer;
+    c2_cntr64_t timestampUs;
+    std::uint64_t frameIndex;
+};
+std::list<OutputBuffer> outputBuffers;
 
 void C2SoftFlacEnc::process(
         const std::unique_ptr<C2Work> &work,
@@ -245,12 +246,10 @@ void C2SoftFlacEnc::process(
         mWroteHeader = true;
     }
 
-    const uint32_t sampleRate = mIntf->getSampleRate();
     const uint32_t channelCount = mIntf->getChannelCount();
     const bool inputFloat = mIntf->getPcmEncodingInfo() == C2Config::PCM_FLOAT;
     const unsigned sampleSize = inputFloat ? sizeof(float) : sizeof(int16_t);
     const unsigned frameSize = channelCount * sampleSize;
-    const uint64_t outTimeStamp = mProcessedSamples * 1000000ll / sampleRate;
 
     size_t outCapacity = inSize;
     outCapacity += mBlockSize * frameSize;
@@ -269,6 +268,33 @@ void C2SoftFlacEnc::process(
         work->result = C2_CORRUPTED;
         return;
     }
+
+    class FillWork {
+    public:
+        FillWork(uint32_t flags, C2WorkOrdinalStruct ordinal,
+                 const std::shared_ptr<C2Buffer> &buffer)
+            : mFlags(flags), mOrdinal(ordinal), mBuffer(buffer) {}
+        ~FillWork() = default;
+
+        void operator()(const std::unique_ptr<C2Work> &work) {
+            work->worklets.front()->output.flags = (C2FrameData::flags_t)mFlags;
+            work->worklets.front()->output.buffers.clear();
+            work->worklets.front()->output.ordinal = mOrdinal;
+            work->workletsProcessed = 1u;
+            work->result = C2_OK;
+            if (mBuffer) {
+                work->worklets.front()->output.buffers.push_back(mBuffer);
+            }
+            ALOGV("timestamp = %lld, index = %lld, w/%s buffer",
+                  mOrdinal.timestamp.peekll(), mOrdinal.frameIndex.peekll(),
+                  mBuffer ? "" : "o");
+        }
+
+    private:
+        const uint32_t mFlags;
+        const C2WorkOrdinalStruct mOrdinal;
+        const std::shared_ptr<C2Buffer> mBuffer;
+    };
 
     mEncoderWriteData = true;
     mEncoderReturnedNbBytes = 0;
@@ -308,14 +334,29 @@ void C2SoftFlacEnc::process(
         mOutputBlock.reset();
         return;
     }
-    fillEmptyWork(work);
-    if (mEncoderReturnedNbBytes != 0) {
-        std::shared_ptr<C2Buffer> buffer = createLinearBuffer(std::move(mOutputBlock), 0, mEncoderReturnedNbBytes);
-        work->worklets.front()->output.buffers.push_back(buffer);
-        work->worklets.front()->output.ordinal.timestamp = mAnchorTimeStamp + outTimeStamp;
-    } else {
-        ALOGV("encoder process_interleaved returned without data to write");
+
+    while (outputBuffers.size() > 1) {
+        const OutputBuffer& front = outputBuffers.front();
+        C2WorkOrdinalStruct ordinal = work->input.ordinal;
+        ordinal.frameIndex = front.frameIndex;
+        ordinal.timestamp = front.timestampUs;
+        cloneAndSend(work->input.ordinal.frameIndex.peeku(), work,
+                     FillWork(C2FrameData::FLAG_INCOMPLETE, ordinal, front.buffer));
+        outputBuffers.pop_front();
     }
+
+    std::shared_ptr<C2Buffer> buffer;
+    C2WorkOrdinalStruct ordinal = work->input.ordinal;
+    if (!outputBuffers.empty()) {
+        ordinal.frameIndex = outputBuffers.front().frameIndex;
+        ordinal.timestamp = outputBuffers.front().timestampUs;
+        buffer = outputBuffers.front().buffer;
+        outputBuffers.pop_front();
+    }
+    // Mark the end of frame
+    FillWork((C2FrameData::flags_t)(eos ? C2FrameData::FLAG_END_OF_STREAM : 0),
+             ordinal, buffer)(work);
+
     mOutputBlock = nullptr;
     if (eos) {
         mSignalledOutputEos = true;
@@ -349,6 +390,8 @@ FLAC__StreamEncoderWriteStatus C2SoftFlacEnc::onEncodedFlacAvailable(
     // write encoded data
     C2WriteView wView = mOutputBlock->map().get();
     uint8_t* outData = wView.data();
+    const uint32_t sampleRate = mIntf->getSampleRate();
+    const uint64_t outTimeStamp = mProcessedSamples * 1000000ll / sampleRate;
     ALOGV("writing %zu bytes of encoded data on output", bytes);
     // increment mProcessedSamples to maintain audio synchronization during
     // play back
@@ -359,7 +402,12 @@ FLAC__StreamEncoderWriteStatus C2SoftFlacEnc::onEncodedFlacAvailable(
         return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
     }
     memcpy(outData + mEncoderReturnedNbBytes, buffer, bytes);
+
+    std::shared_ptr<C2Buffer> c2Buffer =
+        createLinearBuffer(mOutputBlock, mEncoderReturnedNbBytes, bytes);
+    outputBuffers.push_back({c2Buffer, mAnchorTimeStamp + outTimeStamp, current_frame});
     mEncoderReturnedNbBytes += bytes;
+
     return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
 }
 
